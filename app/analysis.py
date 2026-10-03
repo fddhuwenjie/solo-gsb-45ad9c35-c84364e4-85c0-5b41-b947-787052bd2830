@@ -110,6 +110,14 @@ class RuleSet:
             parsed=self.parsed, declarations=declarations, layers=self.layers
         )
 
+    def with_layers(self, layers: list[str] | tuple[str, ...]) -> "RuleSet":
+        """替换层声明顺序，复用已解析的选择器骨架与声明表。"""
+        return RuleSet(
+            parsed=self.parsed,
+            declarations=self.declarations,
+            layers=tuple(layers),
+        )
+
     def layer_index(
         self, overrides: Mapping[tuple[int, int], str | None] | None = None
     ) -> dict[str, int]:

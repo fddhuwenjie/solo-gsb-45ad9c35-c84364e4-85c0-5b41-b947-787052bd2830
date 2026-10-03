@@ -1,0 +1,42 @@
+{
+  "root": {
+    "id": "app",
+    "tag": "div",
+    "classes": [],
+    "attributes": {},
+    "children": [
+      {
+        "id": "lead",
+        "tag": "p",
+        "classes": [],
+        "attributes": {},
+        "children": []
+      }
+    ]
+  },
+  "layers": ["reset", "base", "components"],
+  "rules": [
+    {
+      "selector": "p",
+      "layer": "base",
+      "declarations": [
+        {"property": "--gap", "value": "8px"},
+        {"property": "color", "value": "var(--gap, red)"}
+      ]
+    },
+    {
+      "selector": "p",
+      "layer": "components",
+      "declarations": [
+        {"property": "--gap", "value": "12px"}
+      ]
+    }
+  ],
+  "constraints": [
+    {"earlier_layer": "reset", "later_layer": "components"}
+  ],
+  "guards": [
+    {"node_id": "lead", "property": "color", "result": "computed"},
+    {"node_id": "lead", "property": "--gap", "result": "custom_properties"}
+  ]
+}

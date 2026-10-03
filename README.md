@@ -14,6 +14,7 @@ docker compose up --build
 - `POST /compute` — 层叠计算；携带 `patches` 时返回样式变更预演（基线 / 补丁后结果、逐项差异、因果轨迹与未生效补丁）
 - `POST /stylesheet-audit` — 样式表清理审计：在 DOM 样本树上逐节点复用选择器与层叠 / `var()` 求值，找出可同时删除而不改变任何节点 computed、custom_properties 或 invalid 状态的声明批次
 - `POST /dom-impact` — DOM 变更样式影响分析：对指定节点做一次原子变更（增删 class、设置 / 删除 attribute、修改 tag），整树重算后返回所有 computed、custom_properties 或 invalid 变化的节点及前后值，并归因选择器命中 / 层叠胜出者 / 继承 / `var()` 链
+- `POST /layer-migration` — 样式层级调整迁移规划：枚举最多 6 个现有层的可行顺序，按层先后约束与保护项筛选，整树重算后选择影响签名最少的唯一方案
 - `POST /selector-overlap` — 不提供 DOM 样本，判断两条选择器能否命中同一元素
 - `POST /keyframe-sample` — CSS 数值属性关键帧采样
 - `POST /counter-render` — CSS 计数器元素树渲染（counter-reset/set/increment 与 counter()/counters()）
@@ -33,7 +34,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ## 整树分析内核
 
-`/compute`、`/stylesheet-audit`、`/dom-impact` 与 `/compute` 预演（patches）
+`/compute`、`/stylesheet-audit`、`/dom-impact`、`/layer-migration` 与 `/compute` 预演（patches）
 共享同一个**不可变整树分析内核**（`app/analysis.py`），不再各自维护节点
 状态签名与差异判断：
 
@@ -577,6 +578,61 @@ curl -X POST http://localhost:8000/dom-impact \
 注意：变更本身合法、但它对样式没有任何影响时（如添加一个没有任何规则
 使用的 class）返回 **200**，只是 `affected_nodes` 为空数组；只有操作级
 的空操作才返回 422。
+
+## POST /layer-migration：样式层级调整迁移规划
+
+给定一棵带唯一 id 的 DOM 样本树、**最多 6 个现有层**、结构化规则、必须满足的
+层先后约束，以及必须保护的节点属性结果，接口枚举这些层的所有排列，先用
+`constraints` 过滤，再对每种层序重新计算整棵树。未分层声明不参与重排；
+普通声明仍按「晚层优先」，`!important` 声明仍由同一层叠引擎按「早层优先」
+反向裁决。
+
+请求示例：
+
+```bash
+curl -X POST http://localhost:8000/layer-migration \
+  -H 'Content-Type: application/json' \
+  -d @examples/layer-migration.json
+```
+
+`guards[].result` 可取：
+
+- `computed`：保护普通属性当前为 computed 的完整签名；
+- `invalid`：保护普通属性当前为 invalid 的状态、取值 `null` 与失效原因；
+- `custom_properties`：保护自定义属性（属性名必须以 `--` 开头），包含本元素
+  胜出声明或纯继承来源、状态、解析值与失效原因。
+
+这里的签名与 `/dom-impact`、`/stylesheet-audit` 共用：**胜出声明定位 +
+状态 + 取值 + 失效原因**。因此即使两个层序计算出的值相同，只要胜出声明改变，
+该节点属性仍计为一个受影响签名，也会导致保护项失败。
+
+### 方案选择与响应
+
+- `total_permutations`：层的全部排列数；`evaluated_orders`：通过层先后约束、
+  实际整树重算的顺序数；
+- `feasible_orders`：满足全部保护项的层序，每项给出
+  `affected_signature_count`（相对当前层序变化的节点属性签名总数）与
+  `affected_node_count`；
+- `selected_order`：唯一推荐顺序，先取 `affected_signature_count` 最小，
+  平手时按层名字典序；`affected_nodes` 给出选中方案的逐项前后差异，字段与
+  `/dom-impact` 相同，包含同值但胜出声明变化的属性；
+- 若层约束本身成环，返回 `feasible: false` 与 `conflicting_constraint`，
+  `constraint_index` 是请求约束数组中首个形成环的下标，不枚举层序；
+- 若约束可满足但没有任何层序能同时满足全部保护项，返回最早使可行集合变空的
+  `conflicting_guard`（`guard_index` 为请求数组下标），并在
+  `variable_evidence` 中给出该保护项在基线 / 阻断层序下的自定义属性继承、
+  `var()` 主分支、fallback 改道或无 fallback 失败证据。
+
+### 校验（HTTP 422）
+
+以下任一错误整批返回 422，不产生部分方案：
+
+- 样本树存在重复 id、节点 id / tag 非法，或规则选择器、属性名非法；
+- `layers` 超过 6 个、层名重复 / 空白；规则引用未声明的层；
+- `constraints` 引用未知层，或要求一个层排在自身之前；
+- `guards` 引用不存在的节点；`computed` / `invalid` 保护项当前不存在对应状态，
+  或 `custom_properties` 保护项不是 `--` 自定义属性。
+
 
 ## POST /selector-overlap：选择器可命中性判断
 

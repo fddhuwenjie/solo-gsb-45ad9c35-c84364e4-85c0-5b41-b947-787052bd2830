@@ -11,6 +11,7 @@ from .dom_impact import DomImpactValidationError, analyze_dom_impact
 from .gamut_map import GamutMapError, gamut_map
 from .grid_tracks import GridTracksError, solve_grid_tracks
 from .keyframe import KeyframeValidationError, sample_keyframes
+from .layer_migration import LayerMigrationValidationError, plan_layer_migration
 from .math_eval import MathEvaluationError, evaluate_math
 from .models import (
     ColorMixRequest,
@@ -28,6 +29,8 @@ from .models import (
     GridTracksResponse,
     KeyframeSampleRequest,
     KeyframeSampleResponse,
+    LayerMigrationRequest,
+    LayerMigrationResponse,
     MathEvaluateRequest,
     MathEvaluateResponse,
     OverlapRequest,
@@ -47,7 +50,8 @@ app = FastAPI(
     " CSS 数值属性关键帧采样、CSS 计数器元素树渲染、CSS 数学表达式求值、"
     "单行 CSS Grid 列宽求解、color-mix() 风格两色混合、OKLCH -> sRGB 色域映射，"
     "在 DOM 样本树上逐节点审计可安全删除声明批次的样式表清理，"
-    "以及对节点做一次原子 DOM 变更后的整树样式影响分析。",
+    "对节点做一次原子 DOM 变更后的整树样式影响分析，"
+    "以及枚举层序并按保护项选择样式层级迁移方案。",
 )
 
 
@@ -102,6 +106,19 @@ def dom_impact_endpoint(req: DomImpactRequest) -> DomImpactResponse:
     except SelectorSyntaxError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except (DomImpactValidationError, AuditValidationError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/layer-migration", response_model=LayerMigrationResponse)
+def layer_migration_endpoint(req: LayerMigrationRequest) -> LayerMigrationResponse:
+    """样式层级调整迁移规划：枚举最多 6 个现有层的可行顺序，按层先后约束与
+    保护项过滤，对每种顺序整树重算；important 声明仍由层叠引擎按反向层序裁决。
+    重复 id、未知层、非法约束或不存在的保护项整批返回 422。"""
+    try:
+        return plan_layer_migration(req)
+    except SelectorSyntaxError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except LayerMigrationValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Literal, Optional, Union
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
 
 Origin = Literal["ua", "user", "author"]
 
@@ -1005,3 +1005,176 @@ class DomImpactResponse(BaseModel):
     target_id: object
     mutation: MutationOut
     affected_nodes: list[NodeImpactOut]
+
+
+# ---------- POST /layer-migration ----------
+
+
+class LayerConstraint(BaseModel):
+    """普通声明层序约束：earlier_layer 必须排在 later_layer 之前。
+
+    important 声明的层序由层叠引擎自动反向裁决；这里约束的始终是声明顺序
+    （早层 -> 晚层）。也接受 before/after、from/to 等常见字段别名。
+    """
+
+    earlier_layer: str = Field(
+        validation_alias=AliasChoices(
+            "earlier_layer", "before_layer", "before", "from_layer", "from"
+        )
+    )
+    later_layer: str = Field(
+        validation_alias=AliasChoices(
+            "later_layer", "after_layer", "after", "to_layer", "to"
+        )
+    )
+
+    @field_validator("earlier_layer", "later_layer")
+    @classmethod
+    def _layer_name_not_blank(cls, v):
+        if not isinstance(v, str) or not v.strip():
+            raise ValueError("层名必须为非空字符串")
+        return v
+
+
+class LayerGuard(BaseModel):
+    """必须保持不变的一个节点属性结果。
+
+    result 为 computed 时保护普通属性的 computed 状态与胜出签名；为 invalid
+    时保护该属性的 invalid 状态与失效原因；为 custom_properties 时保护自定义
+    属性（含纯继承）的完整状态。
+    """
+
+    node_id: object = Field(
+        validation_alias=AliasChoices("node_id", "nodeId", "node", "id")
+    )
+    property: str
+    result: str = Field(
+        validation_alias=AliasChoices("result", "kind", "type", "protect")
+    )
+
+    @field_validator("result")
+    @classmethod
+    def _normalize_result(cls, v):
+        if not isinstance(v, str):
+            raise ValueError("result 必须为 computed、custom_properties 或 invalid")
+        aliases = {
+            "computed": "computed",
+            "custom_properties": "custom_properties",
+            "custom-properties": "custom_properties",
+            "customproperties": "custom_properties",
+            "custom": "custom_properties",
+            "invalid": "invalid",
+        }
+        normalized = aliases.get(v.lower())
+        if normalized is None:
+            raise ValueError("result 必须为 computed、custom_properties 或 invalid")
+        return normalized
+
+    @field_validator("node_id", mode="before")
+    @classmethod
+    def _id_type(cls, v):
+        if isinstance(v, bool) or not isinstance(v, (str, int)):
+            raise ValueError("保护节点 node_id 必须为非空字符串或整数")
+        if isinstance(v, str) and not v.strip():
+            raise ValueError("保护节点 node_id 不能为空字符串")
+        return v
+
+    @field_validator("property")
+    @classmethod
+    def _property_not_blank(cls, v):
+        if not isinstance(v, str) or not v.strip():
+            raise ValueError("保护属性 property 必须为非空字符串")
+        return v
+
+
+class LayerMigrationRequest(BaseModel):
+    """样式层级迁移规划请求。"""
+
+    root: AuditElement
+    layers: list[str] = Field(default_factory=list, max_length=6)
+    rules: list[Rule] = Field(default_factory=list)
+    constraints: list[LayerConstraint] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices(
+            "constraints", "layer_constraints", "order_constraints", "required_order"
+        ),
+    )
+    guards: list[LayerGuard] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices(
+            "guards", "protections", "protected_results", "protected"
+        ),
+    )
+
+    @field_validator("layers")
+    @classmethod
+    def _layer_names_unique_and_non_blank(cls, v):
+        seen: set[str] = set()
+        for layer in v:
+            if not layer or not layer.strip():
+                raise ValueError("layers 中不能包含空或空白层名")
+            if layer in seen:
+                raise ValueError(f"layers 中存在重复层名：{layer!r}")
+            seen.add(layer)
+        return v
+
+
+class LayerOrderImpactOut(BaseModel):
+    """一种候选层序相对当前层序的影响摘要。"""
+
+    layers: list[str]
+    affected_signature_count: int
+    affected_node_count: int
+
+
+class LayerMigrationNodeOut(BaseModel):
+    """选中方案中的一个受影响节点及其变化属性。"""
+
+    node_id: object
+    changes: list[PropertyImpactOut]
+
+
+class LayerGuardOut(BaseModel):
+    """导致某层序不可迁移的首个保护项（guard_index 为请求数组下标）。"""
+
+    guard_index: int
+    node_id: object
+    property: str
+    result: str
+    detail: str
+
+
+class LayerConstraintOut(BaseModel):
+    """无法满足的最早层序约束（constraint_index 为请求数组下标）。"""
+
+    constraint_index: int
+    earlier_layer: str
+    later_layer: str
+    detail: str
+
+
+class VariableEvidenceOut(BaseModel):
+    """变量继承 / fallback 传播证据。"""
+
+    node_id: object
+    property: str
+    is_custom: bool
+    before: list[str] = Field(default_factory=list)
+    after: list[str] = Field(default_factory=list)
+
+
+class LayerMigrationResponse(BaseModel):
+    """层级迁移规划结果。"""
+
+    nodes_checked: int
+    current_layers: list[str]
+    feasible: bool
+    selected_order: Optional[list[str]] = None
+    affected_signature_count: Optional[int] = None
+    affected_nodes: list[LayerMigrationNodeOut] = Field(default_factory=list)
+    feasible_orders: list[LayerOrderImpactOut] = Field(default_factory=list)
+    evaluated_orders: int
+    total_permutations: int
+    conflicting_constraint: Optional[LayerConstraintOut] = None
+    conflicting_guard: Optional[LayerGuardOut] = None
+    variable_evidence: list[VariableEvidenceOut] = Field(default_factory=list)
