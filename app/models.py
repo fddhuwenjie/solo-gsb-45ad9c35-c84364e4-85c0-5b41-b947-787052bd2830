@@ -1005,3 +1005,170 @@ class DomImpactResponse(BaseModel):
     target_id: object
     mutation: MutationOut
     affected_nodes: list[NodeImpactOut]
+
+
+# ---------- POST /layer-migration ----------
+
+
+class LayerConstraint(BaseModel):
+    """一条层先后约束：before 层在新层序中必须排在 after 层之前（不要求相邻）。
+
+    两侧层名都必须已在 layers 中声明；before 与 after 相同、或与之前的约束
+    重复均属非法约束（422）。约束之间自相矛盾（成环）不是 422，而是导致
+    无可行方案（响应 status 为 no_plan 并给出最早冲突约束）。
+    """
+
+    before: str
+    after: str
+
+    @field_validator("before", "after")
+    @classmethod
+    def _layer_not_blank(cls, v):
+        if not isinstance(v, str) or not v.strip():
+            raise ValueError("层先后约束的层名不能为空白")
+        return v
+
+
+class LayerProtectionIn(BaseModel):
+    """一个需保护的节点属性结果。
+
+    该节点上此属性的共享签名（胜出声明定位 + computed/invalid 或
+    ok/invalid/missing 状态 + 取值 + 失效原因）在新层序下必须与当前层序
+    完全一致。属性名以 -- 开头时保护的是 custom_properties 中的自定义属性，
+    否则保护 computed / invalid 中的普通属性结果（普通属性名按小写归一，
+    自定义属性名大小写敏感，与 /compute 同一口径）。
+    """
+
+    node_id: object
+    property: str
+
+    @field_validator("node_id", mode="before")
+    @classmethod
+    def _id_type(cls, v):
+        if isinstance(v, bool) or not isinstance(v, (str, int)):
+            raise ValueError("保护项 node_id 必须为非空字符串或整数")
+        if isinstance(v, str) and not v.strip():
+            raise ValueError("保护项 node_id 不能为空字符串")
+        return v
+
+    @field_validator("property")
+    @classmethod
+    def _property_not_blank(cls, v):
+        if not v or not v.strip():
+            raise ValueError("保护项 property 不能为空白")
+        return v
+
+
+class LayerMigrationRequest(BaseModel):
+    """样式层级迁移规划请求。
+
+    root / layers / rules 结构同 /stylesheet-audit：layers 为**当前**层声明
+    顺序（早 -> 晚，1 到 6 个）；constraints 为新层序必须满足的层先后约束；
+    protections 为需保护的节点属性结果。服务枚举满足约束的全部层序并逐一
+    整树重算，只保留满足全部保护项的层序，再按「受影响签名最少、层序字典序」
+    选定唯一新层序。
+    """
+
+    root: AuditElement
+    layers: list[str] = Field(default_factory=list)
+    rules: list[Rule] = Field(default_factory=list)
+    constraints: list[LayerConstraint] = Field(default_factory=list)
+    protections: list[LayerProtectionIn] = Field(default_factory=list)
+
+
+class LayerProtectionOut(BaseModel):
+    """成功响应中的保护项回显（选定层序下全部满足）。"""
+
+    node_id: object
+    property: str
+    is_custom: bool
+    satisfied: bool
+
+
+class LayerAffectedOut(BaseModel):
+    """选定层序相对当前层序的一个受影响 (节点, 属性) 签名。
+
+    reasons / before / after / detail 与 /dom-impact 的变化项同构：
+    层序调整不改变选择器命中，因此 reasons 只可能出现 cascade_winner
+    （胜出声明换人，含同值换人）、inheritance（自定义属性经继承传导）与
+    var_chain（var() 依赖链取值 / 失效状态变化，含 fallback 改道）。
+    """
+
+    node_id: object
+    property: str
+    is_custom: bool
+    reasons: list[str]
+    before: PropertyValueOut
+    after: PropertyValueOut
+    detail: str
+
+
+class LayerMigrationResponse(BaseModel):
+    """迁移规划结果（status 为 ok）：选定的新层序及其相对当前层序的影响。"""
+
+    status: str = "ok"
+    nodes_checked: int
+    current_order: list[str]  # 当前层序（请求 layers 回显）
+    selected_order: list[str]  # 选定的新层序
+    changed: bool  # selected_order 是否与 current_order 不同
+    orders_evaluated: int  # 满足全部约束的候选层序数
+    orders_satisfying_protections: int  # 其中满足全部保护项的层序数
+    affected_count: int  # 选定层序相对当前层序受影响的 (节点, 属性) 签名数
+    affected: list[LayerAffectedOut]
+    protections: list[LayerProtectionOut]
+
+
+class LayerConstraintConflictOut(BaseModel):
+    """约束集不可满足时的最早冲突约束（按输入顺序逐条加入，第一条成环者）。"""
+
+    constraint_index: int
+    before: str
+    after: str
+    detail: str
+
+
+class LayerProtectionEvidenceOut(BaseModel):
+    """保护项在参照层序（受影响最少、再按字典序的可行层序）下被破坏的证据。
+
+    reasons 与 /dom-impact 同口径（cascade_winner / inheritance / var_chain），
+    detail 为中文传播说明（含变量继承与 fallback 改道）。
+    """
+
+    order: list[str]
+    reasons: list[str]
+    before: PropertyValueOut
+    after: PropertyValueOut
+    detail: str
+
+
+class LayerProtectionVerdictOut(BaseModel):
+    """无方案响应中单个保护项的可满足性判定。
+
+    satisfiable 为 False 表示没有任何满足约束的层序能保住该保护项，
+    此时 evidence 给出参照层序下的破坏证据；为 True 表示该保护项单独
+    可满足、但无法与其余保护项同时满足；约束集不可满足、无法评估时为 null。
+    """
+
+    node_id: object
+    property: str
+    is_custom: bool
+    satisfiable: Optional[bool]
+    baseline: PropertyValueOut
+    evidence: Optional[LayerProtectionEvidenceOut] = None
+
+
+class LayerMigrationNoPlanResponse(BaseModel):
+    """无可行迁移方案（status 为 no_plan）。
+
+    约束自相矛盾时 conflict 给出最早冲突约束、orders_evaluated 为 0、
+    best_effort_order 为 null；否则为保护项无法同时满足，protections
+    逐项给出可满足性与变量继承 / fallback 传播证据。
+    """
+
+    status: str = "no_plan"
+    nodes_checked: int
+    current_order: list[str]
+    orders_evaluated: int
+    conflict: Optional[LayerConstraintConflictOut]
+    best_effort_order: Optional[list[str]]
+    protections: list[LayerProtectionVerdictOut]

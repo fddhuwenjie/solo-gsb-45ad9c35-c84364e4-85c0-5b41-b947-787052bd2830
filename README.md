@@ -14,6 +14,7 @@ docker compose up --build
 - `POST /compute` — 层叠计算；携带 `patches` 时返回样式变更预演（基线 / 补丁后结果、逐项差异、因果轨迹与未生效补丁）
 - `POST /stylesheet-audit` — 样式表清理审计：在 DOM 样本树上逐节点复用选择器与层叠 / `var()` 求值，找出可同时删除而不改变任何节点 computed、custom_properties 或 invalid 状态的声明批次
 - `POST /dom-impact` — DOM 变更样式影响分析：对指定节点做一次原子变更（增删 class、设置 / 删除 attribute、修改 tag），整树重算后返回所有 computed、custom_properties 或 invalid 变化的节点及前后值，并归因选择器命中 / 层叠胜出者 / 继承 / `var()` 链
+- `POST /layer-migration` — 样式层级迁移规划：给定当前层序（最多 6 个层）、层先后约束与需保护的节点属性结果，枚举可行层序并逐一整树重算，按「受影响签名最少、层序字典序」选定唯一新层序；无方案时返回最早冲突约束与保护项传播证据
 - `POST /selector-overlap` — 不提供 DOM 样本，判断两条选择器能否命中同一元素
 - `POST /keyframe-sample` — CSS 数值属性关键帧采样
 - `POST /counter-render` — CSS 计数器元素树渲染（counter-reset/set/increment 与 counter()/counters()）
@@ -33,9 +34,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ## 整树分析内核
 
-`/compute`、`/stylesheet-audit`、`/dom-impact` 与 `/compute` 预演（patches）
-共享同一个**不可变整树分析内核**（`app/analysis.py`），不再各自维护节点
-状态签名与差异判断：
+`/compute`、`/stylesheet-audit`、`/dom-impact`、`/layer-migration` 与
+`/compute` 预演（patches）共享同一个**不可变整树分析内核**（`app/analysis.py`），
+不再各自维护节点状态签名与差异判断：
 
 - **`RuleSet`**：一次解析的规则集（选择器、特异性、源码次序、层声明顺序）。
   审计的逐条试删、DOM 变更的基线 / 变更后、预演的基线 / 补丁后 / 留一法
@@ -48,8 +49,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
   `computed` / `custom_properties` / `invalid`（含失效原因）、自定义属性
   沿祖先链的继承与 `var()` 依赖记录（解析事件、依赖图、循环集合）；
 - **`NodeAnalysis.signature()`**：三处前后对比（审计试删、DOM 变更、
-  补丁预演）共享的节点状态签名——每个属性记录「胜出声明定位 +
-  `computed`/`invalid`（或 `ok`/`invalid`）状态 + 取值 + 失效原因」。
+  补丁预演）与层迁移规划的逐层序比对共享的节点状态签名——每个属性记录
+  「胜出声明定位 + `computed`/`invalid`（或 `ok`/`invalid`）状态 + 取值 +
+  失效原因」。
 
 因此**胜出者改变但取值相同**、失效原因变化（如循环依赖失效变为 var()
 解析失败）都计为变化；完全未变的节点不会进入任何一方的结果。
@@ -577,6 +579,131 @@ curl -X POST http://localhost:8000/dom-impact \
 注意：变更本身合法、但它对样式没有任何影响时（如添加一个没有任何规则
 使用的 class）返回 **200**，只是 `affected_nodes` 为空数组；只有操作级
 的空操作才返回 422。
+
+## POST /layer-migration：样式层级迁移规划
+
+调整 `@layer` 层级顺序是高风险重构：层序同时参与普通声明（晚层优先）与
+important 声明（**反向层序**，早层优先）的裁决，任何重排都可能改变整棵
+DOM 树上某些节点的样式。本端点为这类调整做**迁移规划**：给定 DOM 样本树、
+**当前层序** `layers`（1 到 6 个现有层）、结构化规则 `rules`、新层序
+**必须满足的层先后约束** `constraints`，以及**需保护的节点属性结果**
+`protections`，服务枚举满足约束的全部层序、**按每个顺序用整树分析内核
+重算整棵树**，只保留满足全部保护项的层序，最后按「相对当前层序受影响
+（节点， 属性）签名数最少、再按层序字典序」选定**唯一**新层序。
+
+- `constraints[]`：`{"before": "reset", "after": "components"}` 表示
+  reset 层在新层序中必须排在 components 层之前（不要求相邻）；引用的层
+  必须已在 `layers` 中声明；
+- `protections[]`：`{"node_id": "lead", "property": "padding"}` 表示该
+  节点上此属性的共享签名（胜出声明定位 + `computed`/`invalid` 或
+  `ok`/`invalid`/`missing` 状态 + 取值 + 失效原因）必须与当前层序完全
+  一致；属性名以 `--` 开头时保护 `custom_properties` 中的自定义属性，
+  否则保护 `computed` / `invalid` 中的普通属性结果（普通属性名按小写
+  归一，自定义属性名大小写敏感）。
+
+```bash
+curl -X POST http://localhost:8000/layer-migration \
+  -H 'Content-Type: application/json' \
+  -d @examples/layer-migration.json
+```
+
+`examples/layer-migration.json` 的样本树为
+`div#app.dark > (h1#title, p.text#lead > code#code)`，当前层序
+`[reset, base, components]`，约束要求 `reset → components → base`
+（依次在前）。唯一可行层序为 `[reset, components, base]`：`code` 的
+`color` 原由 components 层的 `navy` 胜出，层序调整后改由 base 层的
+`var(--gap)`（解析为 `12px`）胜出；保护项（`lead` 的 `padding`、
+`app` 的 `--gap`）在新层序下保持不变。响应（节选）：
+
+```json
+{
+  "status": "ok",
+  "nodes_checked": 4,
+  "current_order": ["reset", "base", "components"],
+  "selected_order": ["reset", "components", "base"],
+  "changed": true,
+  "orders_evaluated": 1,
+  "orders_satisfying_protections": 1,
+  "affected_count": 1,
+  "affected": [
+    {"node_id": "code", "property": "color", "is_custom": false,
+     "reasons": ["cascade_winner"],
+     "before": {"status": "computed", "value": "navy", "winner": {"rule_index": 5, "...": "..."}},
+     "after":  {"status": "computed", "value": "12px", "winner": {"rule_index": 4, "...": "..."}},
+     "detail": "普通属性 color：computed = 'navy' → computed = '12px'；层叠胜出声明由规则 5 第 0 条（'navy'）改由规则 4 第 0 条（'var(--gap)'）胜出"}
+  ],
+  "protections": [
+    {"node_id": "lead", "property": "padding", "is_custom": false, "satisfied": true},
+    {"node_id": "app", "property": "--gap", "is_custom": true, "satisfied": true}
+  ]
+}
+```
+
+### 选定规则与受影响签名
+
+- 候选层序为 `layers` 的全部排列中满足每条 `before → after` 约束者
+  （`orders_evaluated` 即其数量；规则引用未声明层时与 `/compute` 同款，
+  按首次出现追加到所有候选层序的末尾，不参与重排）；
+- 每个候选层序都与当前层序做**整树签名比对**（与 `/stylesheet-audit`、
+  `/dom-impact` 同一份共享签名）：**同值但胜出声明变化也算受影响**，
+  失效原因变化、经继承 / `var()` 链传导的取值变化同样计入；
+- 先按受影响（节点， 属性）签名数最少筛选，再按层序字典序选定唯一层序；
+  `affected[]` 逐项给出 `before` / `after` 状态与归因（层序调整不改变
+  选择器命中，`reasons` 只可能出现 `cascade_winner` / `inheritance` /
+  `var_chain`）；
+- 当前层序本身也是候选之一：若它满足全部约束与保护项且没有比它更优的
+  层序，`selected_order` 与 `current_order` 相同、`changed` 为 `false`
+  （无需迁移）。
+
+### 无可行方案（status: no_plan）
+
+没有任何候选层序满足全部保护项、或约束集本身自相矛盾时，返回
+`status: "no_plan"`（HTTP 200）：
+
+- **约束成环**：`conflict` 给出**最早冲突约束**——按输入顺序逐条加入
+  约束时第一条使约束集合成环的约束（`constraint_index` 与已有约束链），
+  此时 `orders_evaluated` 为 0、`best_effort_order` 为 `null`，保护项
+  的 `satisfiable` 为 `null`（无可行层序可评估）；
+- **保护项无法同时满足**：`protections[]` 逐项给出判定——`satisfiable`
+  为 `false` 表示**任何**可行层序都保不住该项，并附 `evidence`：参照
+  层序（受影响最少、再按字典序的可行层序，即 `best_effort_order`）下
+  该项的 `before` / `after`、归因 `reasons`（`cascade_winner` /
+  `inheritance` / `var_chain`）与中文 `detail`，完整呈现**变量继承与
+  fallback 传播证据**（如祖先自定义属性换人经继承传导、`var()` 主分支
+  改道 fallback、循环依赖形成 / 解除）；`satisfiable` 为 `true` 表示
+  该项单独可满足、只是无法与其余保护项同时满足。
+
+```json
+{
+  "status": "no_plan",
+  "orders_evaluated": 1,
+  "conflict": null,
+  "best_effort_order": ["y", "x"],
+  "protections": [
+    {"node_id": "r", "property": "color", "is_custom": false,
+     "satisfiable": false,
+     "baseline": {"status": "computed", "value": "blue", "...": "..."},
+     "evidence": {"order": ["y", "x"], "reasons": ["cascade_winner"],
+                  "before": {"status": "computed", "value": "blue"},
+                  "after": {"status": "computed", "value": "red"},
+                  "detail": "..."}}
+  ]
+}
+```
+
+### 校验（HTTP 422，整批拒绝，不产生部分结果）
+
+- 节点 `id` 缺失 / 为空 / 为布尔，或树中存在**重复 id**；节点 `tag`
+  空白、`children` / `classes` 为 `null`（与 `/stylesheet-audit` 同口径）；
+- `layers` 为空、超过 **6** 个、层名空白或重复；
+- 约束引用**未知层**（未在 `layers` 中声明）、`before` 与 `after` 相同、
+  或与之前的约束重复（约束成环不是 422，而是 `no_plan`）；
+- 保护项引用的节点不存在、该节点上不存在此属性的结果（`computed` /
+  `custom_properties` / `invalid` 中均未出现）、保护项重复，或属性名空白；
+- 规则选择器语法非法，或声明 `property` 为空白。
+
+既有接口（如不带 patches 的 `/compute`）及其余接口、
+`docker compose up --build` 启动方式均保持不变。
 
 ## POST /selector-overlap：选择器可命中性判断
 
@@ -1426,7 +1553,8 @@ g/b 为负），需要映射；固定 L=0.7、h=30°、alpha=0.8 二分 15 轮�
 ```
 app/
   main.py       FastAPI 入口（POST /compute、POST /stylesheet-audit、
-                POST /dom-impact、POST /selector-overlap、
+                POST /dom-impact、POST /layer-migration、
+                POST /selector-overlap、
                 POST /keyframe-sample、
                 POST /counter-render、POST /math-evaluate、POST /grid-tracks、
                 POST /color-mix、POST /gamut-map、GET /health）
@@ -1458,10 +1586,14 @@ app/
   dom_impact.py DOM 变更影响分析：原子变更校验与应用、基线 / 变更后
                 整树重算、逐节点共享签名比对与选择器命中 / 层叠 /
                 继承 / var() 链归因
+  layer_migration.py 样式层级迁移规划：层 / 约束 / 保护项校验、满足约束的
+                层序枚举与逐层序整树重算、保护项过滤与「受影响签名最少 +
+                字典序」选定、无方案时的最早冲突约束与传播证据
 tests/test_cascade.py     /compute 端到端测试
 tests/test_preview.py     /compute 样式变更预演（patches）端到端测试
 tests/test_stylesheet_audit.py /stylesheet-audit 端到端测试
 tests/test_dom_impact.py  /dom-impact 端到端测试
+tests/test_layer_migration.py /layer-migration 端到端测试
 tests/test_analysis_kernel.py 整树分析内核一致性端到端测试（嵌套继承、
                           fallback 改道、循环解除、同值换胜出者、非法输入）
 tests/test_overlap.py     /selector-overlap 端到端测试
@@ -1475,6 +1607,7 @@ examples/request.json          /compute 示例请求
 examples/preview.json           /compute 样式变更预演示例请求（携带 patches）
 examples/stylesheet-audit.json  /stylesheet-audit 示例请求
 examples/dom-impact.json        /dom-impact 示例请求
+examples/layer-migration.json   /layer-migration 示例请求
 examples/keyframe-sample.json  /keyframe-sample 示例请求
 examples/counter-render.json   /counter-render 示例请求
 examples/math-evaluate.json    /math-evaluate 示例请求

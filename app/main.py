@@ -1,6 +1,8 @@
 """FastAPI 应用入口。"""
 from __future__ import annotations
 
+from typing import Union
+
 from fastapi import FastAPI, HTTPException
 
 from .engine import compute
@@ -11,6 +13,7 @@ from .dom_impact import DomImpactValidationError, analyze_dom_impact
 from .gamut_map import GamutMapError, gamut_map
 from .grid_tracks import GridTracksError, solve_grid_tracks
 from .keyframe import KeyframeValidationError, sample_keyframes
+from .layer_migration import LayerMigrationValidationError, plan_layer_migration
 from .math_eval import MathEvaluationError, evaluate_math
 from .models import (
     ColorMixRequest,
@@ -28,6 +31,9 @@ from .models import (
     GridTracksResponse,
     KeyframeSampleRequest,
     KeyframeSampleResponse,
+    LayerMigrationNoPlanResponse,
+    LayerMigrationRequest,
+    LayerMigrationResponse,
     MathEvaluateRequest,
     MathEvaluateResponse,
     OverlapRequest,
@@ -47,7 +53,8 @@ app = FastAPI(
     " CSS 数值属性关键帧采样、CSS 计数器元素树渲染、CSS 数学表达式求值、"
     "单行 CSS Grid 列宽求解、color-mix() 风格两色混合、OKLCH -> sRGB 色域映射，"
     "在 DOM 样本树上逐节点审计可安全删除声明批次的样式表清理，"
-    "以及对节点做一次原子 DOM 变更后的整树样式影响分析。",
+    "对节点做一次原子 DOM 变更后的整树样式影响分析，"
+    "以及枚举可行层序并选定唯一新层序的样式层级迁移规划。",
 )
 
 
@@ -102,6 +109,27 @@ def dom_impact_endpoint(req: DomImpactRequest) -> DomImpactResponse:
     except SelectorSyntaxError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except (DomImpactValidationError, AuditValidationError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post(
+    "/layer-migration",
+    response_model=None,
+    responses={200: {"model": Union[LayerMigrationResponse, LayerMigrationNoPlanResponse]}},
+)
+def layer_migration_endpoint(req: LayerMigrationRequest):
+    """样式层级迁移规划：给定 DOM 样本树、当前层序（最多 6 个层）、结构化
+    规则、必须满足的层先后约束与需保护的节点属性结果，枚举满足约束的全部
+    层序并逐一整树重算（important 声明仍按反向层序裁决），只保留满足全部
+    保护项的层序，再按「相对当前层序受影响 (节点, 属性) 签名数最少、层序
+    字典序」选定唯一新层序（同值但胜出声明变化也算受影响）。无可行方案时
+    返回最早冲突约束、逐保护项可满足性与变量继承 / fallback 传播证据。
+    重复 id、未知层、非法约束或不存在的保护项整批 422，不产生部分结果。"""
+    try:
+        return plan_layer_migration(req)
+    except SelectorSyntaxError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except (LayerMigrationValidationError, AuditValidationError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
